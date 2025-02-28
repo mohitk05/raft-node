@@ -96,7 +96,7 @@ export class RaftNode {
     this.setupRaftHandler();
     this._expressRaft.listen(this._raftPort, () => {
       this.logToConsole("Started raft server");
-      this.scheduleLeaderElectionTimer();
+      this.resetLeaderElectionTimeout();
     });
 
     this.setupKVHandler();
@@ -221,7 +221,9 @@ export class RaftNode {
               entries,
               leaderCommit: this.commitIndex,
             }),
-          }).then((res) => res.json())
+          })
+            .then((res) => res.json())
+            .catch(() => ({ success: false }))
         )
     );
 
@@ -248,14 +250,20 @@ export class RaftNode {
               lastLogIndex: this.log.length - 1,
               lastLogTerm: this.log[this.log.length - 1].term,
             }),
-          }).then((res) => res.json())
+          })
+            .then((res) => res.json())
+            .catch(() => ({ voteGranted: null }))
         )
     );
 
+    // self vote
+    results.push({ term: this.currentTerm, voteGranted: true });
+
     this.logToConsole("rpcRequestVote", results);
     return (
-      results.filter((r) => r.voteGranted).length >
-      (this._servers.length - 1) / 2
+      results.filter((r) => r.voteGranted !== null).filter((r) => r.voteGranted)
+        .length >
+      this._servers.length / 2
     );
   }
 
@@ -274,16 +282,16 @@ export class RaftNode {
       this.moveToLeader();
     } else {
       this.state = State.Follower;
-      this.scheduleLeaderElectionTimer();
+      this.resetLeaderElectionTimeout();
       this.logToConsole("Moved back to follower");
     }
   }
 
-  private async scheduleLeaderElectionTimer() {
+  private async resetLeaderElectionTimeout() {
     if (this._leaderElectionTimeout) clearTimeout(this._leaderElectionTimeout);
     this._leaderElectionTimeout = setTimeout(() => {
       this.moveToCandidate();
-    }, 500 + Math.random() * 500);
+    }, 1000 + Math.random() * 500);
   }
 
   private AppendEntries({
@@ -297,16 +305,12 @@ export class RaftNode {
     this.logToConsole("AppendEntries", entries);
     if (term === this.currentTerm && this.state === State.Candidate) {
       this.state = State.Follower;
-      this.scheduleLeaderElectionTimer();
     }
+
+    this.resetLeaderElectionTimeout();
 
     if (term < this.currentTerm) {
       return { term: this.currentTerm, success: false };
-    }
-
-    if (this._leaderElectionTimeout) {
-      clearTimeout(this._leaderElectionTimeout);
-      this._leaderElectionTimeout = null;
     }
 
     if (
@@ -336,15 +340,24 @@ export class RaftNode {
     this.logToConsole(
       "RequestVote",
       term,
+      this.currentTerm,
       candidateId,
       lastLogIndex,
       lastLogTerm,
       this.log.length - 1
     );
+
+    if (term < this.currentTerm) {
+      return { term: this.currentTerm, voteGranted: false };
+    }
+
+    const oldTerm = this.currentTerm;
+
     if (term > this.currentTerm) {
       this.currentTerm = term;
       this.state = State.Follower;
-      this.scheduleLeaderElectionTimer();
+      if (this._leaderElectionTimeout)
+        clearTimeout(this._leaderElectionTimeout);
     }
 
     if (
@@ -361,7 +374,7 @@ export class RaftNode {
       };
     }
 
-    if (this.votedFor || this.votedFor === candidateId) {
+    if (this.votedFor && term === oldTerm) {
       return {
         term: this.currentTerm,
         voteGranted: false,
